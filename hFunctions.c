@@ -1,5 +1,6 @@
 #pragma warning(suppress : 6011)
 #include "hFunctions.h"
+#include <wchar.h> 
 
 
 VMM_HANDLE hVMM = NULL;
@@ -105,6 +106,65 @@ BOOL updateVadMap() {
     }
     return 1;
 }
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+#include <windows.h>
+#define MAX_LINE_LEN 1024
+#define MAX_NAME_LEN 256
+typedef struct {
+    unsigned int index;
+    unsigned int process_id;
+    uint64_t dtb;
+    uint64_t kernelAddr;
+    char name[MAX_NAME_LEN];
+} Info;
+#define MAX_DTBS 128
+bool patch_dtb(BYTE* bytes, size_t buffer_size, const char* target_process_name, uint32_t target_pid, HANDLE vHandle) {
+    uint64_t possible_dtbs[MAX_DTBS];
+    size_t dtb_count = 0;
+
+    char* lines = (char*)bytes;
+    lines[buffer_size - 1] = '\0';
+
+    char* line = strtok(lines, "\r\n");
+    while (line && dtb_count < MAX_DTBS) {
+        Info info;
+        memset(&info, 0, sizeof(Info));
+
+        int parsed = sscanf(line, "%x %u %llx %llx %s", &info.index, &info.process_id, &info.dtb, &info.kernelAddr, info.name);
+        if (parsed >= 5) {
+            if (info.process_id == 0 || strstr(info.name, target_process_name)) {
+                possible_dtbs[dtb_count++] = info.dtb;
+            }
+        }
+
+        line = strtok(NULL, "\r\n");
+    }
+
+    for (size_t i = 0; i < dtb_count; ++i) {
+        uint64_t dtb = possible_dtbs[i];
+        VMMDLL_ConfigSet(vHandle, VMMDLL_OPT_PROCESS_DTB | target_pid, dtb);
+
+        VMMDLL_MAP_MODULEENTRY module_entry;
+        BOOL result = VMMDLL_Map_GetModuleFromNameU(vHandle, target_pid, (LPSTR)target_process_name, &module_entry, NULL);
+        if (result) {
+            printf("[+] Patched DTB\n");
+            return true;
+        }
+    }
+
+    return false;
+}
+uint64_t cbSize = 0x80000ULL; 
+VOID cbAddFile(_Inout_ HANDLE h, _In_ LPCSTR uszName, _In_ ULONG64 cb, _In_opt_ PVMMDLL_VFS_FILELIST_EXINFO pExInfo)
+{
+    if (strcmp(uszName, "dtb.txt") == 0)
+        cbSize = cb;
+}
+#define MsgBox(msg) MessageBoxA(NULL, msg, "Info", MB_OK)
 
 /**
  * @brief   Get the process handle(in our case the PID)
@@ -115,6 +175,63 @@ BOOL updateVadMap() {
  */
 HANDLE __stdcall hOpenProcess(DWORD dwDesirteedAccess, BOOL bInheritHandle, DWORD dwProcessId)
 {
+    if (!VMMDLL_InitializePlugins(hVMM))
+    {
+        MsgBox("[-] Failed VMMDLL_InitializePlugins call");
+        return 0;
+    }
+
+    BOOL bResult;
+
+    Sleep(500);
+
+    while (1)
+    {
+        BYTE bytes[4] = { 0 };
+        DWORD i = 0;
+        NTSTATUS nt = VMMDLL_VfsReadW(hVMM, (LPWSTR)L"\\misc\\procinfo\\progress_percent.txt", bytes, 3, &i, 0);
+        if (nt == VMMDLL_STATUS_SUCCESS && atoi((char*)bytes) == 100)
+            break;
+
+        Sleep(100);
+    }
+
+    VMMDLL_VFS_FILELIST2 VfsFileList;
+    VfsFileList.dwVersion = VMMDLL_VFS_FILELIST_VERSION;
+    VfsFileList.h = 0;
+    VfsFileList.pfnAddDirectory = 0;
+    VfsFileList.pfnAddFile = cbAddFile; //dumb af callback who made this system
+
+    bResult = VMMDLL_VfsListU(hVMM, (LPSTR)("\\misc\\procinfo\\"), &VfsFileList);
+    if (!bResult)
+        return 0;
+
+    const size_t buffer_size = cbSize;
+    BYTE* bytes = (BYTE*)malloc(buffer_size);
+    if (!bytes)
+    {
+        MsgBox("[-] Failed to allocate");
+        return 0;
+    }
+
+    DWORD j = 0;
+    NTSTATUS nt = VMMDLL_VfsReadW(hVMM, (LPWSTR)L"\\misc\\procinfo\\dtb.txt", bytes, buffer_size - 1, &j, 0);
+    if (nt != VMMDLL_STATUS_SUCCESS) 
+    {
+        char anan[256];
+        snprintf(anan, 256, "nt %d", nt);
+        MsgBox(anan);
+        free(bytes);
+        return 0;
+    }
+
+    BOOL bProceed = patch_dtb(bytes, buffer_size, (LPWSTR)L"\\misc\\procinfo\\dtb.txt", dwProcessId, hVMM);
+    if (!bProceed)
+    {
+        MsgBox("can't");
+        free(bytes);
+        return 0;
+    }
     currentPID = dwProcessId;
     vadMapInitialized = FALSE;
 
